@@ -1,0 +1,528 @@
+# OpenSandbox CLI
+
+`osb` is the command-line interface for OpenSandbox. It is built for the common day-to-day flows:
+
+- create and manage sandboxes
+- build golden-image templates and create sandboxes from templates or snapshots
+- run commands inside a sandbox
+- read and modify sandbox files
+- inspect runtime egress policy
+- manage sandbox-local Credential Vault state
+- collect low-level diagnostics
+- install OpenSandbox-specific skills for coding agents
+
+It uses the OpenSandbox Python SDK under the hood and is intended to be the shortest path from a terminal to a working sandbox workflow.
+
+## Install
+
+Choose one:
+
+```bash
+pip install opensandbox-cli
+```
+
+```bash
+uv tool install opensandbox-cli
+```
+
+```bash
+pipx install opensandbox-cli
+```
+
+Confirm the install:
+
+```bash
+osb --help
+osb --version
+```
+
+## Before You Start
+
+Make sure an OpenSandbox server is reachable. If you are running locally, start the server first and then point the CLI at it.
+
+```bash
+opensandbox-server
+```
+
+## Quick Start
+
+### 1. Initialize config
+
+```bash
+osb config init
+osb config set connection.domain localhost:8080
+osb config set connection.protocol http
+osb config set connection.api_key <your-api-key>
+osb config show -o json
+```
+
+If you want a non-default config file, choose it at the root command level for the whole invocation:
+
+```bash
+osb --config /tmp/dev.toml config init
+osb --config /tmp/dev.toml config set connection.domain localhost:8080
+osb --config /tmp/dev.toml config show -o json
+```
+
+### 2. Create a sandbox
+
+```bash
+osb sandbox create --image python:3.12 --timeout 30m -o json
+```
+
+If you set defaults first, later create commands can be shorter:
+
+```bash
+osb config set defaults.image python:3.12
+osb config set defaults.timeout 30m
+osb sandbox create -o json
+```
+
+### 3. Verify it is usable
+
+```bash
+osb sandbox get <sandbox-id> -o json
+osb sandbox health <sandbox-id> -o json
+```
+
+### 4. Run a command inside the sandbox
+
+Use `--` before the sandbox command payload.
+
+```bash
+osb command run <sandbox-id> -o raw -- python -c "print(1 + 1)"
+```
+
+### 5. Read or write a file
+
+```bash
+osb file write <sandbox-id> /workspace/hello.txt -c "hello" -o json
+osb file cat <sandbox-id> /workspace/hello.txt -o raw
+```
+
+### 6. Clean up
+
+```bash
+osb sandbox kill <sandbox-id> -o json
+```
+
+## Common Tasks
+
+### Create sandboxes
+
+Basic:
+
+```bash
+osb sandbox create --image python:3.12
+```
+
+Private image:
+
+```bash
+osb sandbox create \
+  --image my-registry.example.com/team/app:latest \
+  --image-auth-username alice \
+  --image-auth-password <token>
+```
+
+Manual cleanup mode:
+
+```bash
+osb sandbox create --image python:3.12 --timeout none
+```
+
+Explicit entrypoint argv:
+
+```bash
+osb sandbox create \
+  --image python:3.12 \
+  --entrypoint python \
+  --entrypoint -m \
+  --entrypoint http.server
+```
+
+Create with network policy and volumes:
+
+```bash
+osb sandbox create \
+  --image python:3.12 \
+  --network-policy-file network-policy.json \
+  --volumes-file volumes.json
+```
+
+Create with Credential Vault proxy enabled:
+
+```bash
+osb sandbox create --image python:3.12 --network-policy-file network-policy.json --credential-proxy -o json
+```
+
+Create from a template (golden image):
+
+```bash
+osb sandbox create --template <template-id> --timeout 30m -o json
+```
+
+Template mode fixes the workload shape on the server: `--image`, `--env`, `--resource`, `--entrypoint`, `--volumes-file`, and `--credential-proxy` cannot be combined with `--template`. Only `--timeout` (required), `--metadata`, `--extension`, and `--network-policy-file` may accompany it. Only templates in the `Succeeded` phase can be used. See [Manage templates](#manage-templates).
+
+Create from a snapshot:
+
+```bash
+osb sandbox create --snapshot-id <snapshot-id> --timeout 30m -o json
+```
+
+`--image`, `--template`, and `--snapshot-id` are mutually exclusive.
+
+Create from a request file (`-f`, like `kubectl apply -f`):
+
+```bash
+osb sandbox create -f sandbox-request.json -o json
+```
+
+`sandbox-request.json` uses the public `CreateSandboxRequest` JSON format (camelCase keys):
+
+```json
+{
+  "image": "python:3.12",
+  "timeout": 1800,
+  "resourceLimits": { "cpu": "1", "memory": "2Gi" },
+  "entrypoint": ["python", "-m", "http.server"],
+  "networkPolicy": {
+    "defaultAction": "deny",
+    "egress": [{ "action": "allow", "target": "pypi.org" }]
+  }
+}
+```
+
+- Exactly one of `image` (string or `{ "uri": ..., "auth": { "username": ..., "password": ... } }`), `templateId`, or `snapshotId` is required; `timeout` is integer seconds, or `null` for manual cleanup.
+- Supported fields: `image`, `templateId`, `snapshotId`, `platform`, `timeout`, `resourceLimits`, `resourceRequests`, `env`, `metadata`, `extensions`, `entrypoint`, `networkPolicy`, `credentialProxy`, `secureAccess`, `volumes`, `lifecycle`.
+- `-f` cannot be combined with request-building flags; `--skip-health-check`, `--ready-timeout`, and `-o` still apply. In template mode the file may only set `timeout`, `metadata`, `extensions`, and `networkPolicy` alongside `templateId` (a finite `timeout` is required).
+
+### Manage templates
+
+Templates are golden-image builds; the build runs asynchronously, so poll `template get` until the status phase is `Succeeded`. Template management requires a Kubernetes-backed runtime.
+
+```bash
+osb template create --image python:3.12 --publish s3://bucket/publish --format native -o json
+osb template create --image python:3.12 --publish oci://registry.example.com/sandbox/templates --format overlaybd -o json
+osb template get <template-id> -o json
+osb template list -o json
+osb template delete <template-id> -o json
+```
+
+`template create` also accepts `--resource cpu=1 memory=512Mi disk=2Gi`, `--entrypoint` (repeat per argv item), `--env KEY=VALUE`, `--metadata KEY=VALUE`, `--format native|overlaybd`, `--readiness-probe`, and `--warmup-seconds`. Or pass a request file in the public `CreateTemplateRequest` JSON format:
+
+```bash
+osb template create -f template-request.json -o json
+```
+
+```json
+{
+  "image": "python:3.12",
+  "publish": "s3://bucket/publish",
+  "format": "native",
+  "resourceLimits": { "cpu": "1", "memory": "512Mi" },
+  "readiness": { "probe": "tcp://127.0.0.1:44772", "warmupSeconds": 60 }
+}
+```
+
+OCI targets must name a repository without a tag or digest. Use `overlaybd` (the default) for OCI and explicitly select `native` for S3. The builder returns an immutable OCI reference in `status.manifestRef`; `sandbox create --template` uses that reference automatically. See [OCI template setup](../docs/guides/oci-templates.md) for Registry Secrets and runtime prerequisites.
+
+### Manage snapshots
+
+Snapshots capture a sandbox's state and can back new sandboxes.
+
+```bash
+osb snapshot create <sandbox-id> --name golden -o json
+osb snapshot get <snapshot-id> -o json
+osb snapshot list --sandbox-id <sandbox-id> -o json
+osb snapshot delete <snapshot-id> -o json
+```
+
+### List and inspect sandboxes
+
+```bash
+osb sandbox list
+osb sandbox list -o json
+osb sandbox list --state running --state paused
+osb sandbox get <sandbox-id> -o json
+osb sandbox metrics <sandbox-id>
+osb sandbox metrics <sandbox-id> --watch -o raw
+```
+
+### Pause a sandbox
+
+Pause is asynchronous. `Pause request accepted` confirms that the server accepted the request, not that the sandbox has reached the `Paused` state. Poll the sandbox until the transition finishes:
+
+```bash
+osb sandbox pause <sandbox-id>
+osb sandbox get <sandbox-id> -o json
+```
+
+### Expose a service
+
+```bash
+osb sandbox endpoint <sandbox-id> --port 8080 -o json
+```
+
+### Run commands
+
+Foreground streaming:
+
+```bash
+osb command run <sandbox-id> -o raw -- sh -lc 'echo ready'
+```
+
+Tracked background execution:
+
+```bash
+osb command run <sandbox-id> --background -o json -- sh -c "sleep 10; echo done"
+osb command status <sandbox-id> <execution-id> -o json
+osb command logs <sandbox-id> <execution-id> -o json
+```
+
+Background start errors or a stream ending before startup confirmation make the CLI exit non-zero without success metadata. After a successful start, use `command status` and `command logs` to check the process's eventual result.
+
+By default the payload after `--` is joined into one shell command string, so pipelines, redirection, and `$VAR` expansion work as in a terminal. Add `--argv` to pass the arguments to the executable as a literal argv list (no shell) when values such as `$HOME`, quotes, embedded spaces, or empty strings must reach the process unchanged. `--argv` needs a sandbox image whose execd accepts argv requests:
+
+```bash
+osb command run <sandbox-id> -o raw --argv -- python3 -c "import sys; print(sys.argv[1:])" "a b" '$HOME' "x'y" ""
+```
+
+Persistent shell session:
+
+```bash
+osb command session create <sandbox-id> --workdir /workspace -o json
+osb command session run <sandbox-id> <session-id> -o raw -- pwd
+osb command session run <sandbox-id> <session-id> -o raw -- export FOO=bar
+osb command session run <sandbox-id> <session-id> -o raw -- sh -c 'echo $FOO'
+osb command session delete <sandbox-id> <session-id> -o json
+```
+
+### Open an interactive terminal
+
+`osb terminal` attaches your current terminal to a real PTY inside the sandbox (colors, `stty`, and resize all behave like a local shell). Exit the remote shell (or press Ctrl-D) to leave; the remote exit code becomes the command's exit code.
+
+```bash
+osb terminal <sandbox-id>
+osb terminal <sandbox-id> -w /workspace
+```
+
+Requires an interactive TTY, and is supported on Unix, macOS, and Linux. If the connection drops while the shell is still running, the session is kept server-side and its id is printed so it can be inspected or removed via the execd API; a clean exit tears the session down.
+
+### Work with files
+
+```bash
+osb file upload <sandbox-id> ./local.txt /workspace/local.txt -o json
+osb file download <sandbox-id> /workspace/result.json ./result.json -o json
+osb file search <sandbox-id> /workspace --pattern "*.py" -o json
+osb file info <sandbox-id> /workspace/main.py -o json
+osb file replace <sandbox-id> /workspace/app.py --old old --new new -o json
+osb file chmod <sandbox-id> /workspace/script.sh --mode 755 -o json
+```
+
+Downloads replace regular files only on success; a failed or interrupted download preserves any existing regular file. Existing devices and named pipes receive data directly. Stdout aliases (such as `/dev/stdout`) stream only the file bytes, without a success message. See the [CLI guide](../docs/cli/index.md#work-with-files).
+
+### Manage runtime egress policy
+
+Inspect current policy:
+
+```bash
+osb egress get <sandbox-id> -o json
+```
+
+Patch specific rules:
+
+```bash
+osb egress patch <sandbox-id> --rule allow=pypi.org --rule deny=internal.example.com -o json
+```
+
+If you are debugging connectivity, verify behavior with an actual command:
+
+```bash
+osb command run <sandbox-id> -o raw -- curl -I https://pypi.org
+```
+
+### Manage Credential Vault
+
+Credential Vault operations call the sandbox egress sidecar through the Python SDK. Create the sandbox with `--credential-proxy` and an explicit network policy before writing vault state.
+
+```bash
+osb credential-vault create <sandbox-id> --file vault.yaml -o json
+osb credential-vault get <sandbox-id> -o json
+osb credential-vault patch <sandbox-id> --file mutation.yaml -o json
+osb credential-vault credential list <sandbox-id> -o json
+osb credential-vault binding list <sandbox-id> -o json
+osb credential-vault delete <sandbox-id> -o json
+```
+
+Use `--file -` to read a JSON/YAML payload from stdin. Do not pass plaintext credential values as command-line flags; keep them in the payload stream or file.
+
+### Collect diagnostics
+
+Use context to identify the runtime backend, then collect log and event descriptors.
+
+```bash
+osb diagnostics context <sandbox-id> -o json
+osb diagnostics events <sandbox-id> --scope runtime -o raw
+osb diagnostics events <sandbox-id> --scope all -o raw
+osb diagnostics logs <sandbox-id> --scope container -o raw
+osb diagnostics logs <sandbox-id> --scope all -o json
+osb diagnostics events <sandbox-id> --scope runtime -o json
+osb diagnostics logs <sandbox-id> --scope container -o yaml
+```
+
+`context` returns backend routing information without connecting to execd and
+supports table, JSON, and YAML output. `--scope` is required for logs/events.
+The built-in server supports
+`container` and `all` for logs, and `runtime` and `all` for events. It returns
+`DIAGNOSTICS_SCOPE_UNSUPPORTED` for unavailable scopes, including lifecycle events.
+Best-effort scopes may include a `warnings` field when the backend can only
+provide a subset. Raw output prints inline
+diagnostic text, or the content URL when diagnostics are delivered as a
+temporary URL. Structured CLI output follows the SDK/Python field style, for
+example `content_url`, `content_length`, and `expires_at`. Older server builds
+may still return `DIAGNOSTICS_NOT_IMPLEMENTED` for scoped diagnostics.
+
+Legacy DevOps diagnostics remain experimental. Prefer `osb diagnostics logs/events` for stable API-backed log and event collection.
+
+```bash
+osb devops inspect <sandbox-id> -o raw
+osb devops summary <sandbox-id> -o raw
+```
+
+## Output Formats
+
+Output selection is command-scoped, not global.
+
+- `table`: human-readable tables and panels
+- `json`: machine-readable JSON
+- `yaml`: machine-readable YAML
+- `raw`: unformatted text or streaming output
+
+Examples:
+
+```bash
+osb sandbox list -o json
+osb sandbox list -o yaml
+osb file cat <sandbox-id> /workspace/hello.txt -o raw
+```
+
+Not every command supports every format. Use `--help` on the specific command when in doubt.
+
+## Command Groups
+
+The main command groups are:
+
+- `osb sandbox`: lifecycle management
+- `osb template`: golden-image template builds
+- `osb snapshot`: snapshot management
+- `osb command`: command execution and persistent sessions
+- `osb terminal`: interactive PTY terminal into a sandbox
+- `osb file`: file and directory operations
+- `osb egress`: runtime egress policy
+- `osb diagnostics`: stable diagnostics logs and events
+- `osb devops`: experimental legacy diagnostics
+- `osb config`: local CLI configuration
+- `osb skills`: bundled skills for AI tools
+
+Explore them directly:
+
+```bash
+osb sandbox --help
+osb template --help
+osb snapshot --help
+osb command --help
+osb file --help
+osb skills --help
+```
+
+## Agent Skills
+
+The CLI ships with built-in OpenSandbox skills for coding agents and agent-oriented tools.
+
+Bundled skills:
+
+- `sandbox-lifecycle`
+- `command-execution`
+- `file-operations`
+- `network-egress`
+- `sandbox-troubleshooting`
+
+Supported targets:
+
+| Target | Install location |
+| --- | --- |
+| `claude` | `./.claude/skills/<name>/SKILL.md` or `~/.claude/skills/<name>/SKILL.md` |
+| `cursor` | `./.cursor/rules/` or `~/.cursor/rules/` |
+| `codex` | `./.codex/skills/<name>/SKILL.md` or `~/.codex/skills/<name>/SKILL.md` |
+| `copilot` | `./.github/copilot-instructions.md` or `~/.copilot/copilot-instructions.md` |
+| `windsurf` | `./.windsurfrules` or `~/.windsurfrules` |
+| `cline` | `./.clinerules` or `~/.cline/rules/opensandbox-<name>.md` |
+| `opencode` | `./.agents/skills/<name>/SKILL.md` or `~/.agents/skills/<name>/SKILL.md` |
+
+Common flows:
+
+```bash
+osb skills list
+osb skills show sandbox-lifecycle
+osb skills install sandbox-lifecycle --target codex --scope project
+osb skills install --all-builtins --target codex --scope global
+osb skills uninstall sandbox-troubleshooting --target claude --scope global
+```
+
+For scripts or agents, use structured output:
+
+```bash
+osb skills install sandbox-lifecycle --target codex --scope project -o json
+```
+
+## Configuration Model
+
+The CLI resolves configuration in this order:
+
+1. root CLI flags such as `--api-key`, `--domain`, `--protocol`, `--request-timeout`, `--config`
+2. environment variables such as `OPEN_SANDBOX_API_KEY` and `OPEN_SANDBOX_DOMAIN`
+3. config file, defaulting to `~/.opensandbox/config.toml`
+4. SDK defaults
+
+Config commands:
+
+```bash
+osb config init
+osb config show
+osb config set connection.domain localhost:8080
+osb config set connection.protocol http
+osb config set defaults.image python:3.12
+osb config set defaults.timeout 30m
+```
+
+Example config file:
+
+```toml
+[connection]
+api_key = "your-api-key"
+domain = "localhost:8080"
+protocol = "http"
+request_timeout = 30
+use_server_proxy = false
+
+[output]
+color = true
+
+[defaults]
+image = "python:3.12"
+timeout = "30m"
+```
+
+## Development
+
+For local development in this monorepo:
+
+```bash
+cd cli
+uv sync
+uv run osb --help
+uv run pytest
+```
+
+This repository uses a local `uv` source override for the OpenSandbox Python SDK, so running from `cli/` will resolve against the checked-out SDK in the monorepo.
